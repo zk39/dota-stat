@@ -1,0 +1,13 @@
+services:
+  dotastat:
+    build: .
+    container_name: dotastat
+    restart: unless-stopped
+    # 只监听本机回环,公网访问走 nginx 反代,不直接暴露这个端口
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # 把 sqlite 数据库文件挂出来,重新 build 容器时数据不丢
+      - ./dota.db:/app/dota.db

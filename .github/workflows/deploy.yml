@@ -1,0 +1,22 @@
+name: Deploy
+
+# 已改用服务器 cron 轮询部署(deploy/deploy.sh)。
+# 此 Action 不再随 push 自动运行,仅保留手动触发;想切回“推送即部署”把下面换回 push 即可。
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH and deploy
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ${{ secrets.DEPLOY_PATH }}
+            git pull
+            docker compose up -d --build

@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dota 战绩查询</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config = { darkMode: 'class' };</script>
+</head>
+<body class="bg-zinc-950 text-zinc-100 antialiased">
+
+<!-- 顶栏 + 统一搜索 -->
+<header class="sticky top-0 z-10 border-b border-zinc-800 bg-zinc-950/80 backdrop-blur">
+  <div class="mx-auto max-w-6xl px-4 py-3">
+    <div class="flex items-center gap-3">
+      <a href="#/" class="shrink-0 text-lg font-bold tracking-tight text-indigo-400">DOTA<span class="text-zinc-200">战绩</span></a>
+      <form onsubmit="onSearch(event)" class="flex-1">
+        <div class="flex gap-2">
+          <input id="q" placeholder="输入 玩家ID / SteamID64 / 对局ID / 游戏名"
+            class="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-2.5 text-sm placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
+          <button class="shrink-0 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-medium text-white hover:bg-indigo-400">搜索</button>
+        </div>
+        <div id="modeBtns" class="mt-2 flex gap-1 text-xs"></div>
+      </form>
+    </div>
+    <div id="status" class="mt-1 h-4 text-xs text-zinc-500"></div>
+  </div>
+</header>
+
+<main id="app" class="mx-auto max-w-6xl px-4 py-6"></main>
+
+<footer class="mx-auto max-w-6xl px-4 py-8 text-center text-xs text-zinc-600">
+  数据来源 OpenDota / Valve · 段位/MMR 为粗略估算
+</footer>
+
+<script>
+/* ============ 工具 ============ */
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+var app = document.getElementById('app');
+var statusEl = document.getElementById('status');
+function setStatus(t){ statusEl.textContent = t || ''; }
+// 客户端缓存:同一 URL 只拉一次,之后瞬间命中(无感刷新 + 后退秒回)
+var CACHE = new Map();
+async function fetchJSON(url){
+  if(CACHE.has(url)) return CACHE.get(url);
+  var r = await fetch(url); var d = await r.json();
+  if(d && !d.error) CACHE.set(url, d);
+  return d;
+}
+
+/* ============ 段位 ============ */
+var MEDALS = ['','先锋','卫士','中军','统帅','传奇','万古','超凡','冠绝'];
+var MEDAL_COLOR = {
+  1:'bg-zinc-600/30 text-zinc-200 ring-zinc-500/40',
+  2:'bg-emerald-600/25 text-emerald-200 ring-emerald-500/40',
+  3:'bg-teal-600/25 text-teal-200 ring-teal-500/40',
+  4:'bg-sky-600/25 text-sky-200 ring-sky-500/40',
+  5:'bg-indigo-600/25 text-indigo-200 ring-indigo-500/40',
+  6:'bg-fuchsia-600/25 text-fuchsia-200 ring-fuchsia-500/40',
+  7:'bg-cyan-600/25 text-cyan-100 ring-cyan-500/40',
+  8:'bg-amber-600/25 text-amber-100 ring-amber-500/40'
+};
+function rankPoints(rt){ if(rt==null)return null; var m=Math.floor(rt/10),s=rt%10; if(m<1)return null; if(m>=8)return 36; return (m-1)*5+s; }
+function rankFromPoints(p){ if(p==null)return '-'; if(p>=36)return '冠绝'; var medal=Math.floor((p-1)/5)+1,star=((p-1)%5)+1; if(medal<1||medal>7)return '-'; return MEDALS[medal]+' '+star+'星'; }
+function rankName(rt){ return rankFromPoints(rankPoints(rt)); }
+function rankMmrRange(rt){ if(rt==null)return '-'; var m=Math.floor(rt/10),s=rt%10; if(m<1)return '-'; if(m>=8)return '约 5680+'; var low=(m-1)*770+(Math.max(1,s)-1)*154; return '约 '+low+'–'+(low+154); }
+function rankBadge(rt){
+  if(rt==null) return '<span class="text-zinc-600">-</span>';
+  var m=Math.floor(rt/10); if(m<1) return '<span class="text-zinc-600">-</span>'; if(m>8)m=8;
+  return '<span class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ring-1 ring-inset '+(MEDAL_COLOR[m]||MEDAL_COLOR[1])+'">'+esc(rankName(rt))+'</span>';
+}
+function lobbyLabel(m){ if(m.lobby_type===7)return '排位'; if(m.game_mode===23)return '快速'; if(m.lobby_type===0)return '匹配'; return '其他'; }
+function filterName(f){ return {all:'全部',ranked:'排位',normal:'匹配',turbo:'快速'}[f]||f; }
+
+/* ============ 小组件 ============ */
+function card(inner, extra){ return '<section class="mb-4 rounded-xl border border-zinc-800 bg-zinc-900 p-4 '+(extra||'')+'">'+inner+'</section>'; }
+function h3(t){ return '<h3 class="mb-3 text-sm font-semibold text-zinc-300">'+esc(t)+'</h3>'; }
+function pill(text,on,onclick){
+  var base='rounded-md px-2.5 py-1 text-xs border transition';
+  var cls=on?'bg-zinc-100 text-zinc-900 border-zinc-100':'border-zinc-700 text-zinc-300 hover:bg-zinc-800';
+  return '<button class="'+base+' '+cls+'" onclick="'+onclick+'">'+esc(text)+'</button>';
+}
+function tableOpen(cols){
+  return '<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-left text-xs text-zinc-500">'
+    + cols.map(function(c){return '<th class="px-2 py-1.5 font-medium">'+esc(c)+'</th>';}).join('') + '</tr></thead><tbody>';
+}
+function tableClose(){ return '</tbody></table></div>'; }
+function loading(t){ return '<div class="py-10 text-center text-sm text-zinc-500">'+esc(t||'加载中…')+'</div>'; }
+
+/* ============ 路由(哈希;后退按钮天然可用) ============ */
+function go(hash){ if(location.hash===hash){ route(); } else { location.hash = hash; } }
+window.addEventListener('hashchange', route);
+window.addEventListener('DOMContentLoaded', function(){ renderModeBtns(); route(); });
+
+function route(){
+  var h = location.hash.replace(/^#/,'') || '/';
+  var parts = h.split('/').filter(Boolean);
+  if(parts[0]==='player') return viewPlayer(parts[1]);
+  if(parts[0]==='match')  return viewMatch(parts[1]);
+  if(parts[0]==='search') return viewSearch(decodeURIComponent(parts.slice(1).join('/')));
+  return viewHome();
+}
+
+/* ============ 统一搜索 ============ */
+var SEARCH_MODE = 'auto';
+function renderModeBtns(){
+  var modes = [['auto','自动'],['player','玩家'],['match','对局'],['name','名字']];
+  document.getElementById('modeBtns').innerHTML = modes.map(function(m){
+    return pill(m[1], SEARCH_MODE===m[0], "setMode('"+m[0]+"')");
+  }).join(' ');
+}
+function setMode(m){ SEARCH_MODE=m; renderModeBtns(); }
+function onSearch(e){
+  e.preventDefault();
+  var v = document.getElementById('q').value.trim();
+  if(!v) return;
+  var isNum = /^\d+$/.test(v);
+  if(SEARCH_MODE==='name' || (SEARCH_MODE==='auto' && !isNum)) return go('#/search/'+encodeURIComponent(v));
+  if(SEARCH_MODE==='player') return go('#/player/'+v);
+  if(SEARCH_MODE==='match')  return go('#/match/'+v);
+  // auto + 纯数字:17位7656→SteamID64玩家;>30亿→对局;否则→玩家
+  if(v.length>=17 && v.indexOf('7656')===0) return go('#/player/'+v);
+  return go(Number(v) > 3000000000 ? '#/match/'+v : '#/player/'+v);
+}
+
+/* ============ 首页 ============ */
+function viewHome(){
+  app.innerHTML = card(
+    '<div class="py-8 text-center">'
+    + '<div class="text-2xl font-bold text-zinc-200">查询 Dota 战绩</div>'
+    + '<p class="mt-2 text-sm text-zinc-400">上方一个框搞定:游戏名、玩家ID、SteamID64、对局ID 都能搜。</p>'
+    + '<div class="mt-4 flex flex-wrap justify-center gap-2 text-xs text-zinc-400">'
+    +   pill('示例玩家 4044783', false, "go('#/player/4044783')")
+    +   pill('示例对局 8897157671', false, "go('#/match/8897157671')")
+    + '</div></div>');
+  setStatus('');
+}
+
+/* ============ 搜索结果 ============ */
+async function viewSearch(q){
+  var url = '/api/search?q='+encodeURIComponent(q);
+  document.getElementById('q').value = q;
+  if(!CACHE.has(url)) app.innerHTML = card(h3('搜索 “'+esc(q)+'”') + loading('搜索中…'));
+  setStatus(CACHE.has(url)?'':'搜索中…');
+  var d = await fetchJSON(url);
+  setStatus('');
+  if(d.error){ app.innerHTML = card(h3('搜索')+'<p class="text-sm text-rose-400">'+esc(d.error)+'</p>'); return; }
+  var rows = d.results || [];
+  if(!rows.length){ app.innerHTML = card(h3('搜索 “'+esc(q)+'”')+'<p class="text-sm text-zinc-400">没搜到(OpenDota 搜索偶尔抽风,过会儿再试)。</p>'); return; }
+  var body = tableOpen(['','昵称','account_id','最近一把','']);
+  rows.forEach(function(p){
+    var av = p.avatarfull ? '<img src="'+p.avatarfull+'" class="h-8 w-8 rounded-full">' : '';
+    var last = p.last_match_time ? new Date(p.last_match_time).toLocaleDateString() : '未知';
+    body += '<tr class="border-t border-zinc-800 hover:bg-zinc-800/40">'
+      + '<td class="px-2 py-2">'+av+'</td>'
+      + '<td class="px-2 py-2 font-medium">'+esc(p.personaname)+'</td>'
+      + '<td class="px-2 py-2 text-zinc-400">'+p.account_id+'</td>'
+      + '<td class="px-2 py-2 text-zinc-400">'+esc(last)+'</td>'
+      + '<td class="px-2 py-2 text-right">'+pill('主页',false,"go('#/player/"+p.account_id+"')")+'</td></tr>';
+  });
+  body += tableClose();
+  app.innerHTML = card(h3('找到 '+rows.length+' 个玩过 Dota 的同名/近名玩家(按最近一把排序)')+body);
+}
+
+/* ============ 玩家页 ============ */
+var CURRENT_ACC=null, HERO_FILTER='all', HERO_MINRANK='', PLAYER_MATCHES=[];
+var RANK_OPTS=[['','无门槛'],['41','≥ 统帅1'],['51','≥ 传奇1'],['61','≥ 万古1'],['71','≥ 超凡1'],['80','≥ 冠绝']];
+
+async function viewPlayer(id){
+  CURRENT_ACC=id; HERO_FILTER='all'; HERO_MINRANK=''; PLAYER_MATCHES=[];
+  var url = '/api/player?id='+encodeURIComponent(id);
+  var hit = CACHE.has(url);
+  app.innerHTML = '<div id="pProfile">'+(hit?'':card(loading('加载玩家…')))+'</div><div id="pHeroes"></div><div id="pMatches"></div>';
+  setStatus(hit?'':'加载玩家…');
+  var d = await fetchJSON(url);
+  setStatus('');
+  if(d.error){ document.getElementById('pProfile').innerHTML = card('<p class="text-sm text-rose-400">'+esc(d.error)+'</p>'); return; }
+  renderProfile(d);
+  renderHeroSection(d.heroes||[]);
+  loadPlayerMatchesData(id);
+}
+
+function renderProfile(d){
+  var p = d.profile||{};
+  var av = p.avatarfull ? '<img src="'+p.avatarfull+'" class="h-16 w-16 rounded-xl ring-1 ring-zinc-700">' : '';
+  var inner = '<div class="flex items-center gap-4">'
+    + av
+    + '<div class="min-w-0">'
+    +   '<div class="truncate text-xl font-bold">'+esc(p.personaname||('account '+d.account_id))+'</div>'
+    +   '<div class="mt-1 flex flex-wrap items-center gap-2 text-sm text-zinc-400">'
+    +     rankBadge(d.rank_tier)
+    +     '<span>MMR '+rankMmrRange(d.rank_tier)+'</span>'
+    +     '<span class="text-zinc-600">·</span><span>account_id '+d.account_id+'</span>'
+    +   '</div>'
+    + '</div></div>';
+  document.getElementById('pProfile').innerHTML = card(inner);
+}
+
+/* --- 常玩英雄(阵营口径 + 段位门槛) --- */
+function loadHeroesFiltered(f){ HERO_FILTER=f; applyHeroFilters(); }
+function onMinRankChange(sel){ HERO_MINRANK=sel.value; applyHeroFilters(); }
+async function applyHeroFilters(){
+  setStatus('统计英雄胜率'+(HERO_MINRANK?'(段位门槛,较慢)':'')+'…');
+  var url='/api/player_heroes?id='+encodeURIComponent(CURRENT_ACC)+'&filter='+HERO_FILTER+(HERO_MINRANK?('&min_rank='+HERO_MINRANK):'');
+  var d = await fetchJSON(url);
+  setStatus('');
+  if(d.error){ document.getElementById('pHeroes').innerHTML = card('<p class="text-sm text-rose-400">'+esc(d.error)+'</p>'); return; }
+  renderHeroSection(d.heroes||[]);
+}
+function renderHeroSection(heroes){
+  var btns = ['all','ranked','normal','turbo'].map(function(f){ return pill(filterName(f), f===HERO_FILTER, "loadHeroesFiltered('"+f+"')"); }).join(' ');
+  var opts = RANK_OPTS.map(function(o){ return '<option value="'+o[0]+'"'+(o[0]===HERO_MINRANK?' selected':'')+'>'+o[1]+'</option>'; }).join('');
+  var sel = '<select onchange="onMinRankChange(this)" class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs">'+opts+'</select>';
+  var controls = '<div class="mb-3 flex flex-wrap items-center gap-2">'+btns+'<span class="ml-2 text-xs text-zinc-500">段位门槛</span>'+sel+'</div>';
+  var inner = h3('常玩英雄')+controls;
+  if(!heroes.length){ inner += '<p class="text-sm text-zinc-500">该口径下无数据。</p>'; document.getElementById('pHeroes').innerHTML = card(inner); return; }
+  var body = tableOpen(['英雄','场次','胜','胜率','']);
+  heroes.forEach(function(x){
+    var img = x.img ? '<img src="'+x.img+'" class="mr-2 inline-block h-7 w-12 rounded object-cover align-middle">' : '';
+    var wr = x.winrate;
+    var wrCls = wr>=50 ? 'text-emerald-400' : 'text-rose-400';
+    body += '<tr class="border-t border-zinc-800 hover:bg-zinc-800/40">'
+      + '<td class="px-2 py-1.5">'+img+esc(x.name)+'</td>'
+      + '<td class="px-2 py-1.5 text-zinc-400">'+x.games+'</td>'
+      + '<td class="px-2 py-1.5 text-zinc-400">'+x.win+'</td>'
+      + '<td class="px-2 py-1.5 font-medium '+wrCls+'">'+wr+'%</td>'
+      + '<td class="px-2 py-1.5 text-right">'+pill('最近战绩',false,"loadHeroMatches("+x.hero_id+",'"+esc(x.name).replace(/'/g,'')+"')")+'</td></tr>';
+  });
+  body += tableClose();
+  document.getElementById('pHeroes').innerHTML = card(inner+body);
+}
+
+/* --- 全部战绩 + 排位/匹配/快速筛选 + 水平段 --- */
+async function loadPlayerMatchesData(acc){
+  var url = '/api/player_matches?id='+encodeURIComponent(acc);
+  if(!CACHE.has(url)) document.getElementById('pMatches').innerHTML = card(loading('加载战绩…'));
+  var d = await fetchJSON(url);
+  if(d.error){ document.getElementById('pMatches').innerHTML = card('<p class="text-sm text-rose-400">'+esc(d.error)+'</p>'); return; }
+  PLAYER_MATCHES = d.matches||[];
+  renderPlayerMatches('all');
+}
+async function loadHeroMatches(heroId,label){
+  setStatus('拉取 '+label+' 战绩…');
+  var d = await fetchJSON('/api/player_matches?id='+encodeURIComponent(CURRENT_ACC)+'&hero_id='+heroId);
+  setStatus('');
+  if(d.error){ return; }
+  document.getElementById('pMatches').innerHTML = card(h3(label+' 最近战绩('+ (d.matches||[]).length +' 场)') + matchTable(d.matches||[]));
+  window.scrollTo({top:document.getElementById('pMatches').offsetTop-70, behavior:'smooth'});
+}
+function renderPlayerMatches(f){
+  var rows = PLAYER_MATCHES.filter(function(m){
+    if(f==='ranked')return m.lobby_type===7;
+    if(f==='turbo') return m.game_mode===23;
+    if(f==='normal')return m.lobby_type===0 && m.game_mode!==23;
+    return true;
+  });
+  var btns = ['all','ranked','normal','turbo'].map(function(x){ return pill(filterName(x), x===f, "renderPlayerMatches('"+x+"')"); }).join(' ');
+  document.getElementById('pMatches').innerHTML = card(h3('全部战绩')+'<div class="mb-3 flex flex-wrap gap-2">'+btns+'</div>'+matchTable(rows));
+}
+function matchTable(rows){
+  if(!rows.length) return '<p class="text-sm text-zinc-500">无数据。</p>';
+  var body = tableOpen(['英雄','类型','K/D/A','胜负','水平段','时间','']);
+  rows.forEach(function(m){
+    var hero=m._hero||{};
+    var img = hero.img ? '<img src="'+hero.img+'" class="mr-2 inline-block h-7 w-12 rounded object-cover align-middle">' : '';
+    var when = new Date(m.start_time*1000).toLocaleDateString();
+    var wl = m._win ? '<span class="text-emerald-400">胜</span>' : '<span class="text-rose-400">负</span>';
+    body += '<tr class="border-t border-zinc-800 hover:bg-zinc-800/40">'
+      + '<td class="px-2 py-1.5">'+img+esc(hero.name||('#'+m.hero_id))+'</td>'
+      + '<td class="px-2 py-1.5 text-zinc-400">'+lobbyLabel(m)+'</td>'
+      + '<td class="px-2 py-1.5">'+m.kills+' / '+m.deaths+' / '+m.assists+'</td>'
+      + '<td class="px-2 py-1.5">'+wl+'</td>'
+      + '<td class="px-2 py-1.5">'+rankBadge(m.average_rank)+'</td>'
+      + '<td class="px-2 py-1.5 text-zinc-500">'+esc(when)+'</td>'
+      + '<td class="px-2 py-1.5 text-right">'+pill('详情',false,"go('#/match/"+m.match_id+"')")+'</td></tr>';
+  });
+  return body + tableClose();
+}
+
+/* ============ 对局页 ============ */
+async function viewMatch(mid){
+  var url = '/api/match?mode=od&id='+encodeURIComponent(mid);
+  if(!CACHE.has(url)) app.innerHTML = card(loading('加载对局 '+esc(mid)+' …'));
+  setStatus(CACHE.has(url)?'':'加载对局…');
+  var d = await fetchJSON(url);
+  setStatus('');
+  if(d.error){ app.innerHTML = card('<p class="text-sm text-rose-400">'+esc(d.error)+'</p>'); return; }
+  var res = d.result;
+  if(!res){ app.innerHTML = card('<p class="text-sm text-zinc-400">无数据。</p>'); return; }
+  var players = res.players||[];
+  var pts = players.map(function(p){return rankPoints(p.rank_tier);}).filter(function(x){return x!=null;});
+  var avg = pts.length ? Math.round(pts.reduce(function(a,b){return a+b;},0)/pts.length) : null;
+  var min=Math.floor(res.duration/60), sec=res.duration%60;
+  var winSide = res.radiant_win ? '天辉' : '夜魇';
+
+  var head = '<div class="flex flex-wrap items-center gap-3">'
+    + '<div class="text-lg font-bold">对局 '+res.match_id+'</div>'
+    + '<span class="rounded-md bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300">'+lobbyLabel(res)+'</span>'
+    + '<span class="rounded-md px-2 py-0.5 text-xs ring-1 ring-inset '+(res.radiant_win?'bg-emerald-600/20 text-emerald-300 ring-emerald-500/40':'bg-rose-600/20 text-rose-300 ring-rose-500/40')+'">'+winSide+'胜</span>'
+    + '<span class="text-sm text-zinc-400">'+min+'分'+sec+'秒 · 比分 '+(res.radiant_score||0)+':'+(res.dire_score||0)+'</span>'
+    + '<span class="text-sm text-zinc-400">水平段 '+rankFromPoints(avg)+'</span>'
+    + (res._source?'<span class="text-xs text-zinc-600">来源 '+res._source+'</span>':'')
+    + '</div>';
+
+  app.innerHTML = card(head)
+    + teamCard('天辉 Radiant', res.radiant_win, players.filter(function(p){return p._side===0;}))
+    + teamCard('夜魇 Dire', !res.radiant_win, players.filter(function(p){return p._side===1;}));
+}
+
+function teamCard(title, win, players){
+  var badge = win ? '<span class="ml-2 rounded bg-emerald-600/20 px-2 py-0.5 text-xs text-emerald-300 ring-1 ring-inset ring-emerald-500/40">胜</span>'
+                  : '<span class="ml-2 rounded bg-rose-600/20 px-2 py-0.5 text-xs text-rose-300 ring-1 ring-inset ring-rose-500/40">负</span>';
+  var inner = '<h3 class="mb-3 text-sm font-semibold text-zinc-300">'+esc(title)+badge+'</h3>';
+  var body = tableOpen(['玩家','英雄','段位','K/D/A','净资产','GPM/XPM','正/反','装备']);
+  players.forEach(function(p){
+    var hero=p._hero||{};
+    var heroImg = hero.img ? '<img src="'+hero.img+'" class="h-8 w-14 rounded object-cover align-middle" title="'+esc(hero.name)+'">' : '';
+    var av = p._anon ? '<span class="text-zinc-500">匿名</span>'
+      : (p._avatar ? '<img src="'+p._avatar+'" class="h-7 w-7 rounded-full align-middle">' : '');
+    var pname = p._anon ? '<span class="text-zinc-500">匿名</span>'
+      : '<button class="text-indigo-400 hover:underline" onclick="go(\'#/player/'+p.account_id+'\')">'+esc(p._persona||('#'+p.account_id))+'</button>';
+    body += '<tr class="border-t border-zinc-800 hover:bg-zinc-800/40 align-middle">'
+      + '<td class="px-2 py-2"><div class="flex items-center gap-2">'+av+'<div class="min-w-0 max-w-[10rem] truncate">'+pname+'</div></div></td>'
+      + '<td class="px-2 py-2"><div class="flex items-center gap-2">'+heroImg+'<span class="text-zinc-300">'+esc(hero.name||('#'+p.hero_id))+'</span></div></td>'
+      + '<td class="px-2 py-2">'+rankBadge(p.rank_tier)+'</td>'
+      + '<td class="px-2 py-2">'+p.kills+' / '+p.deaths+' / '+p.assists+'</td>'
+      + '<td class="px-2 py-2 text-amber-300">'+(p.net_worth==null?'-':p.net_worth)+'</td>'
+      + '<td class="px-2 py-2 text-zinc-400">'+p.gold_per_min+' / '+p.xp_per_min+'</td>'
+      + '<td class="px-2 py-2 text-zinc-400">'+p.last_hits+' / '+p.denies+'</td>'
+      + '<td class="px-2 py-2">'+itemsHtml(p)+'</td></tr>';
+  });
+  body += tableClose();
+  return card(inner+body);
+}
+function itemsHtml(p){
+  var out='<div class="flex flex-wrap items-center gap-0.5">';
+  (p._items||[]).forEach(function(it){
+    out += it.img ? '<img src="'+it.img+'" class="h-6 w-8 rounded-sm" title="'+esc(it.name)+'">' : '<span class="text-xs text-zinc-500">'+esc(it.name)+'</span>';
+  });
+  if(p._neutral && p._neutral.img) out += '<img src="'+p._neutral.img+'" class="ml-1 h-6 w-6 rounded-full" title="中立:'+esc(p._neutral.name)+'">';
+  return out+'</div>';
+}
+</script>
+
+</body>
+</html>
