@@ -59,7 +59,12 @@ CONCURRENCY_WAIT = float(os.environ.get("DOTA_CONCURRENCY_WAIT", "2"))  # 等不
 
 
 def client_ip(handler):
-    """优先取 nginx 转发的真实 IP(反代场景下 handler.client_address 永远是 127.0.0.1)。"""
+    """取真实客户端 IP。优先 X-Real-IP / CF-Connecting-IP(由 nginx real_ip 模块 / Cloudflare
+    设置,客户端伪造不了);X-Forwarded-For 首值可被客户端伪造,不能用来限速,只做兜底。"""
+    for h in ("X-Real-IP", "CF-Connecting-IP"):
+        v = handler.headers.get(h)
+        if v:
+            return v.strip()
     xff = handler.headers.get("X-Forwarded-For")
     if xff:
         return xff.split(",")[0].strip()
@@ -81,23 +86,44 @@ def rate_limited(ip):
     return n > RATE_MAX
 
 
+_flight_locks = {}
+_flight_guard = threading.Lock()
+
+
+def _flight_lock(key):
+    with _flight_guard:
+        lk = _flight_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _flight_locks[key] = lk
+        return lk
+
+
 def cached(key, fn, ttl=TTL):
-    """key 命中且未过期就返回缓存;否则算一次并存(不缓存报错结果)。"""
-    now = time.time()
+    """命中且未过期→返回缓存;否则算一次并存(不缓存报错结果)。
+    single-flight:同一 key 并发只算一次,其余线程等结果,防止缓存击穿把上游打爆。"""
     with _ttl_lock:
         v = _ttl_store.get(key)
-        if v and v[0] > now:
+        if v and v[0] > time.time():
             return v[1]
-    val = fn()
-    if not (isinstance(val, dict) and val.get("error")):
-        with _ttl_lock:
-            _ttl_store.pop(key, None)              # 重写则挪到末尾,保证“最早写入”排在前面
-            _ttl_store[key] = (now + ttl, val)
-            if len(_ttl_store) > MAX_CACHE:        # 满了:删掉最早的一批,降到上限的 90%
-                target = MAX_CACHE * 9 // 10
-                for k in list(_ttl_store.keys())[:len(_ttl_store) - target]:
-                    _ttl_store.pop(k, None)
-    return val
+    with _flight_lock(key):                        # 同 key 串行:第一个算,其余等
+        with _ttl_lock:                            # 拿到锁后再查一次(别人可能已填好)
+            v = _ttl_store.get(key)
+            if v and v[0] > time.time():
+                return v[1]
+        val = fn()
+        if not (isinstance(val, dict) and val.get("error")):
+            with _ttl_lock:
+                _ttl_store.pop(key, None)          # 重写则挪到末尾,保证“最早写入”排在前面
+                _ttl_store[key] = (time.time() + ttl, val)
+                if len(_ttl_store) > MAX_CACHE:    # 满了:删掉最早的一批,降到上限的 90%
+                    target = MAX_CACHE * 9 // 10
+                    for k in list(_ttl_store.keys())[:len(_ttl_store) - target]:
+                        _ttl_store.pop(k, None)
+            if len(_flight_locks) > 4 * MAX_CACHE:  # 顺手别让 flight 锁无限攒
+                with _flight_guard:
+                    _flight_locks.clear()
+        return val
 
 
 _hero_cache = None
@@ -180,9 +206,9 @@ def db_put_od(match_id, data):
 def fetch_match_opendota(match_id):
     """按 match_id 从 OpenDota 取完整详情(它就是按 match_id 索引的)。
     结果缓存进 SQLite:同一局只调一次 OpenDota,之后离线秒回,避开配额。"""
-    cached = db_get_od(match_id)
-    if cached is not None:
-        return {"result": cached, "_source": "od-cache"}
+    hit = db_get_od(match_id)
+    if hit is not None:
+        return {"result": hit, "_source": "od-cache"}
     try:
         d = od_get("/matches/%d" % int(match_id))
     except Exception as e:
@@ -480,7 +506,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not val.isdigit():
                 self._send(400, json.dumps({"error": "ID 必须是数字"}, ensure_ascii=False))
                 return
-            data = enrich(fetch_match_opendota(val))
+            data = cached("match:" + val, lambda: enrich(fetch_match_opendota(val)))
             self._send(200, json.dumps(data, ensure_ascii=False))
             return
         if u.path == "/api/player":
