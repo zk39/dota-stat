@@ -137,11 +137,11 @@ function filterName(f){ return {all:'全部',ranked:'排位',normal:'匹配',tur
 function card(inner,extra){ return '<section class="card fade p-4 mb-4 sm:p-6 sm:mb-5 '+(extra||'')+'">'+inner+'</section>'; }
 function h3(t){ return '<h3 class="mb-3 text-sm font-semibold sm:text-base" style="color:var(--text)">'+esc(t)+'</h3>'; }
 function pill(text,on,onclick){ return '<button type="button" class="rounded-md px-2.5 py-1.5 text-xs transition sm:px-3 sm:text-sm '+(on?'chip-on':'chip')+'" onclick="'+onclick+'">'+esc(text)+'</button>'; }
-/* 桌面表格:小屏隐藏,交给对应的移动端卡片列表(见各处 xxxMobile 函数) */
-function tableOpen(cols){ return '<div class="hidden overflow-x-auto sm:block"><table class="w-full text-sm sm:text-base"><thead><tr class="text-left text-xs thc">'+cols.map(function(c){return '<th class="px-3 py-2 font-medium whitespace-nowrap">'+esc(c)+'</th>';}).join('')+'</tr></thead><tbody>'; }
+/* 桌面表格只在 ≥1200px 显示(表列多、最小宽度大);<1200px 一律走移动卡片,避免撑破/横向溢出 */
+function tableOpen(cols){ return '<div class="hidden overflow-x-auto min-[1200px]:block"><table class="w-full text-sm sm:text-base"><thead><tr class="text-left text-xs thc">'+cols.map(function(c){return '<th class="px-3 py-2 font-medium whitespace-nowrap">'+esc(c)+'</th>';}).join('')+'</tr></thead><tbody>'; }
 function tableClose(){ return '</tbody></table></div>'; }
-/* 移动端卡片列表容器(与桌面表格互斥显示) */
-function mlistOpen(){ return '<div class="sm:hidden">'; }
+/* 移动/中屏卡片列表容器(<1200px 显示,与桌面表格互斥) */
+function mlistOpen(){ return '<div class="min-[1200px]:hidden">'; }
 function mlistClose(){ return '</div>'; }
 function mrow(inner,extra){ return '<div class="rowh flex items-center gap-3 px-1 py-3 '+(extra||'')+'">'+inner+'</div>'; }
 
