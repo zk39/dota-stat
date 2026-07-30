@@ -17,6 +17,7 @@ import os
 import json
 import time
 import sqlite3
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -33,8 +34,35 @@ ANON = 4294967295                  # 0xFFFFFFFF = 匿名玩家的 account_id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DOTA_DB_PATH", os.path.join(HERE, "dota.db"))
 
-MIN_INTERVAL = float(os.environ.get("DOTA_MIN_INTERVAL", "1.1"))  # 每次 Valve 调用最小间隔(秒)
+MIN_INTERVAL = float(os.environ.get("DOTA_MIN_INTERVAL", "1.1"))  # 每次上游调用最小间隔(秒)
 _last_call = [0.0]
+_throttle_lock = threading.Lock()   # 多线程下把出站上游调用限在 ~1/秒
+
+# ---- TTL 内存缓存:玩家/搜索/战绩这类“会变”的数据缓存一小段时间,挡住重复请求省额度 ----
+TTL = int(os.environ.get("DOTA_CACHE_TTL", "600"))      # 秒,默认 10 分钟
+MAX_CACHE = int(os.environ.get("DOTA_CACHE_MAX", "2000"))  # 缓存条目上限,超了删最早的一批
+_ttl_store = {}
+_ttl_lock = threading.Lock()
+
+
+def cached(key, fn, ttl=TTL):
+    """key 命中且未过期就返回缓存;否则算一次并存(不缓存报错结果)。"""
+    now = time.time()
+    with _ttl_lock:
+        v = _ttl_store.get(key)
+        if v and v[0] > now:
+            return v[1]
+    val = fn()
+    if not (isinstance(val, dict) and val.get("error")):
+        with _ttl_lock:
+            _ttl_store.pop(key, None)              # 重写则挪到末尾,保证“最早写入”排在前面
+            _ttl_store[key] = (now + ttl, val)
+            if len(_ttl_store) > MAX_CACHE:        # 满了:删掉最早的一批,降到上限的 90%
+                target = MAX_CACHE * 9 // 10
+                for k in list(_ttl_store.keys())[:len(_ttl_store) - target]:
+                    _ttl_store.pop(k, None)
+    return val
+
 
 _hero_cache = None
 
@@ -44,11 +72,13 @@ OPENDOTA_KEY = os.environ.get("OPENDOTA_API_KEY")   # 可选,填了配额更高
 
 
 def _get_json(url, _retry=0):
-    """统一的限速 + 429 退避 HTTP GET(Valve 和 OpenDota 共用)。"""
-    wait = MIN_INTERVAL - (time.time() - _last_call[0])
-    if wait > 0:
-        time.sleep(wait)
-    _last_call[0] = time.time()
+    """统一的限速 + 429/5xx 退避 HTTP GET(Valve 和 OpenDota 共用)。"""
+    # 限速门:只锁“等待+记时”这一小段,放行后网络请求可并发,保证 ≤1 次/秒 起新调用
+    with _throttle_lock:
+        wait = MIN_INTERVAL - (time.time() - _last_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.time()
     req = urllib.request.Request(url, headers={"User-Agent": "dota-local/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
@@ -89,15 +119,9 @@ def od_get(path, params=None):
     return _get_json(OPENDOTA + path + q)
 
 
-# ---------------- SQLite 索引库(路线A) ----------------
+# ---------------- SQLite:OpenDota 对局缓存 ----------------
 def get_db():
     con = sqlite3.connect(DB_PATH)
-    con.execute("""CREATE TABLE IF NOT EXISTS matches(
-        match_id   INTEGER PRIMARY KEY,
-        seq_num    INTEGER,
-        start_time INTEGER,
-        data       TEXT)""")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_seq ON matches(seq_num)")
     con.execute("CREATE TABLE IF NOT EXISTS od_cache(match_id INTEGER PRIMARY KEY, data TEXT)")
     return con
 
@@ -131,26 +155,6 @@ def fetch_match_opendota(match_id):
         return {"error": "OpenDota 未收录该对局(可能太新还没入库,或 id 无效)"}
     db_put_od(match_id, d)
     return {"result": d, "_source": "od"}
-
-
-def db_get_match(match_id):
-    con = get_db()
-    row = con.execute("SELECT data FROM matches WHERE match_id=?", (int(match_id),)).fetchone()
-    con.close()
-    return json.loads(row[0]) if row else None
-
-
-def db_put_matches(matches):
-    """批量写入(match 对象来自 BySequenceNum,本身就是完整详情)。"""
-    con = get_db()
-    con.executemany(
-        "INSERT OR IGNORE INTO matches(match_id, seq_num, start_time, data) VALUES(?,?,?,?)",
-        [(m["match_id"], m.get("match_seq_num"), m.get("start_time"), json.dumps(m, ensure_ascii=False))
-         for m in matches])
-    con.commit()
-    n = con.total_changes
-    con.close()
-    return n
 
 
 def get_heroes():
@@ -193,43 +197,6 @@ def get_items():
     return _items_cache
 
 
-def fetch_match(match_id):
-    """按 match_id 查:GetMatchDetails,Valve 偶发 500,重试 3 次。"""
-    last = None
-    for _ in range(3):
-        try:
-            d = api_get("/IDOTA2Match_570/GetMatchDetails/v1/", {"match_id": match_id})
-            return d
-        except urllib.error.HTTPError as e:
-            last = "HTTP %s" % e.code
-        except Exception as e:
-            last = str(e)
-    return {"error": "GetMatchDetails 失败: %s。这是 Valve 端偶发 500,可多试几次,或改用 seq_num 模式。" % last}
-
-
-def fetch_history(account_id, count=25, hero_id=None):
-    """按 account_id 查最近对局(Valve 原生)。传 hero_id 则只返回该英雄的对局。
-    每条带 match_id + match_seq_num,用来点开详情。"""
-    aid = int(account_id)
-    if aid > STEAM64_BASE:          # 用户填了 64 位 steamid,转成 32 位
-        aid -= STEAM64_BASE
-    params = {"account_id": aid, "matches_requested": count}
-    if hero_id:
-        params["hero_id"] = int(hero_id)     # 原生按英雄筛选
-    try:
-        d = api_get("/IDOTA2Match_570/GetMatchHistory/v1/", params)
-        res = d.get("result", {})
-        if res.get("status") != 1:
-            return {"error": "GetMatchHistory status=%s(该号可能没开“公开对战数据”,Dota设置里勾选后才可查)" % res.get("status")}
-        heroes = get_heroes()
-        for m in res.get("matches", []) or []:
-            for p in m.get("players", []) or []:
-                p["_hero"] = heroes.get(str(p.get("hero_id")), {"name": "hero_id %s" % p.get("hero_id"), "img": ""})
-        return {"result": res, "queried_account_id": aid, "hero_id": hero_id}
-    except Exception as e:
-        return {"error": "GetMatchHistory 失败: %s" % e}
-
-
 def fetch_player_opendota(account_id):
     """OpenDota 玩家资料 + 常玩英雄(带胜率)。一次拿到,省去自己翻页统计。"""
     aid = int(account_id)
@@ -263,6 +230,18 @@ def search_players(q):
     # ISO 时间字符串按字典序即按时间序;无时间的排最后
     arr.sort(key=lambda x: (x.get("last_match_time") or ""), reverse=True)
     return {"query": q, "results": arr}
+
+
+def fetch_rank(account_id):
+    """只取段位(供搜索结果按行懒加载,轻量:一次 /players/{id})。"""
+    aid = int(account_id)
+    if aid > STEAM64_BASE:
+        aid -= STEAM64_BASE
+    try:
+        prof = od_get("/players/%d" % aid) or {}
+    except Exception as e:
+        return {"error": str(e)}
+    return {"account_id": aid, "rank_tier": prof.get("rank_tier")}
 
 
 def _process_heroes(raw, hmap, topn=15):
@@ -368,100 +347,6 @@ def fetch_player_matches(account_id, limit=50, hero_id=None):
     return {"account_id": aid, "matches": out, "hero_id": hero_id}
 
 
-def fetch_by_seq(seq_num):
-    """按 match_seq_num 查:GetMatchHistoryBySequenceNum,稳定,结构同 GetMatchDetails。"""
-    try:
-        d = api_get("/IDOTA2Match_570/GetMatchHistoryBySequenceNum/v1/",
-                    {"start_at_match_seq_num": seq_num, "matches_requested": 1})
-        matches = d.get("result", {}).get("matches", [])
-        if not matches:
-            return {"error": "该 seq_num 未返回对局"}
-        return {"result": matches[0]}
-    except Exception as e:
-        return {"error": "GetMatchHistoryBySequenceNum 失败: %s" % e}
-
-
-# ---- match_id -> seq_num 定位器(路线B:插值+二分) ----
-# 锚点:一对已知的 (match_id, seq_num),用来估算全局斜率。两者都随时间从 ~0 增长,
-# 所以 seq ≈ SLOPE * match_id 是个不错的初猜。大版本后可换更新的锚点。
-ANCHOR_ID = 8907752871
-ANCHOR_SEQ = 7487669010
-SLOPE = ANCHOR_SEQ / ANCHOR_ID          # ≈ 0.8406 seq / match_id
-_seq_cache = {}                          # match_id -> 命中过的完整 match 对象(省得重查)
-
-
-def _seq_batch(seq):
-    d = api_get("/IDOTA2Match_570/GetMatchHistoryBySequenceNum/v1/",
-                {"start_at_match_seq_num": max(1, int(seq)), "matches_requested": 100})
-    return d.get("result", {}).get("matches", []) or []
-
-
-RESOLVE_MAX_CALLS = int(os.environ.get("DOTA_RESOLVE_MAX_CALLS", "25"))  # 在线兜底封顶,防限流
-
-
-def resolve_match_by_id(target_id):
-    """任意 match_id → 完整对局。
-    先查本地索引库(秒回);库里没有再走在线定位(封顶 RESOLVE_MAX_CALLS 次),
-    命中后写回库,越用越全。"""
-    target = int(target_id)
-
-    # 1) 本地索引库
-    cached = db_get_match(target)
-    if cached:
-        out = dict(cached); out["_source"] = "db"; out["_resolver_calls"] = 0
-        return {"result": out}
-
-    # 2) 在线定位(插值+二分,封顶)
-    guess = max(1, int(target * SLOPE))
-    lo, hi = 1, None
-    seen = set()
-    calls = 0
-    while calls < RESOLVE_MAX_CALLS:
-        if guess in seen:
-            guess = (lo + (hi if hi else guess * 2)) // 2
-        seen.add(guess)
-        batch = _seq_batch(guess)
-        calls += 1
-        if not batch:
-            hi = guess
-            guess = max(1, (lo + guess) // 2)
-            continue
-        db_put_matches(batch)                    # 顺手把扫到的都入库
-        hit = next((m for m in batch if m["match_id"] == target), None)
-        if hit:
-            out = dict(hit); out["_source"] = "online"; out["_resolver_calls"] = calls
-            return {"result": out}
-        ids = [m["match_id"] for m in batch]
-        min_id, max_id = min(ids), max(ids)
-        seq0 = batch[0]["match_seq_num"]
-        seqN = batch[-1]["match_seq_num"]
-        if target < min_id:
-            hi = seq0
-            g = seq0 - (int((min_id - target) * SLOPE) + 1)
-            guess = (lo + seq0) // 2 if g <= lo else g
-        elif target > max_id:
-            lo = seqN
-            g = seqN + (int((target - max_id) * SLOPE) + 1)
-            guess = (seqN + hi) // 2 if (hi and g >= hi) else g
-        else:
-            # 落在本窗口 id 区间但没精确命中:seq 抖动(长局晚入库),向两侧成批顺扫
-            for k in range(1, RESOLVE_MAX_CALLS - calls):
-                for d in (k * 100, -k * 100):
-                    b2 = _seq_batch(seq0 + d)
-                    calls += 1
-                    db_put_matches(b2)
-                    hit = next((m for m in b2 if m["match_id"] == target), None)
-                    if hit:
-                        out = dict(hit); out["_source"] = "online"; out["_resolver_calls"] = calls
-                        return {"result": out}
-                    if calls >= RESOLVE_MAX_CALLS:
-                        break
-                if calls >= RESOLVE_MAX_CALLS:
-                    break
-            return {"error": "match_id %d 未命中(seq 抖动过大或非公开局)。已用 %d 次调用。建议:用①按 account_id 查(精确),或先 ingest.py 灌流入库。" % (target, calls)}
-    return {"error": "match_id %d 在线定位超预算(%d 次)。建议用①按 account_id 查,或用 ingest.py 把该时段灌入索引库。" % (target, calls)}
-
-
 def enrich(data):
     """给每个 player 补上:_hero(中文名/头像图) 与 _persona/_avatar/_anon(玩家资料)。"""
     res = data.get("result")
@@ -539,29 +424,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/api/match":
             q = urllib.parse.parse_qs(u.query)
             val = (q.get("id") or [""])[0].strip()
-            mode = (q.get("mode") or ["id"])[0]
             if not val.isdigit():
                 self._send(400, json.dumps({"error": "ID 必须是数字"}, ensure_ascii=False))
                 return
-            if mode == "od":
-                data = fetch_match_opendota(val)  # 按 match_id 从 OpenDota 取(推荐)
-            elif mode == "seq":
-                data = fetch_by_seq(val)          # 按 seq_num 从 Valve 取
-            elif mode == "id":
-                data = resolve_match_by_id(val)   # 在线定位器(兜底,慢)
-            else:
-                data = fetch_match(val)
-            data = enrich(data)
-            self._send(200, json.dumps(data, ensure_ascii=False))
-            return
-        if u.path == "/api/history":
-            q = urllib.parse.parse_qs(u.query)
-            val = (q.get("id") or [""])[0].strip()
-            hero = (q.get("hero_id") or [""])[0].strip()
-            if not val.isdigit():
-                self._send(400, json.dumps({"error": "account_id 必须是数字"}, ensure_ascii=False))
-                return
-            data = fetch_history(val, hero_id=(int(hero) if hero.isdigit() else None))
+            data = enrich(fetch_match_opendota(val))
             self._send(200, json.dumps(data, ensure_ascii=False))
             return
         if u.path == "/api/player":
@@ -570,7 +436,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not val.isdigit():
                 self._send(400, json.dumps({"error": "account_id 必须是数字"}, ensure_ascii=False))
                 return
-            self._send(200, json.dumps(fetch_player_opendota(val), ensure_ascii=False))
+            self._send(200, json.dumps(cached("player:" + val, lambda: fetch_player_opendota(val)), ensure_ascii=False))
             return
         if u.path == "/api/search":
             q = urllib.parse.parse_qs(u.query)
@@ -578,7 +444,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not name:
                 self._send(400, json.dumps({"error": "请输入游戏名"}, ensure_ascii=False))
                 return
-            self._send(200, json.dumps(search_players(name), ensure_ascii=False))
+            self._send(200, json.dumps(cached("search:" + name, lambda: search_players(name)), ensure_ascii=False))
+            return
+        if u.path == "/api/rank":
+            q = urllib.parse.parse_qs(u.query)
+            val = (q.get("id") or [""])[0].strip()
+            if not val.isdigit():
+                self._send(400, json.dumps({"error": "account_id 必须是数字"}, ensure_ascii=False))
+                return
+            self._send(200, json.dumps(cached("rank:" + val, lambda: fetch_rank(val), ttl=1800), ensure_ascii=False))
             return
         if u.path == "/api/player_heroes":
             q = urllib.parse.parse_qs(u.query)
@@ -588,7 +462,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not val.isdigit():
                 self._send(400, json.dumps({"error": "account_id 必须是数字"}, ensure_ascii=False))
                 return
-            data = fetch_player_heroes(val, filt, min_rank=(int(mr) if mr.isdigit() else None))
+            data = cached("heroes:%s:%s:%s" % (val, filt, mr),
+                          lambda: fetch_player_heroes(val, filt, min_rank=(int(mr) if mr.isdigit() else None)))
             self._send(200, json.dumps(data, ensure_ascii=False))
             return
         if u.path == "/api/player_matches":
@@ -598,7 +473,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not val.isdigit():
                 self._send(400, json.dumps({"error": "account_id 必须是数字"}, ensure_ascii=False))
                 return
-            data = fetch_player_matches(val, hero_id=(int(hero) if hero.isdigit() else None))
+            data = cached("matches:%s:%s" % (val, hero),
+                          lambda: fetch_player_matches(val, hero_id=(int(hero) if hero.isdigit() else None)))
             self._send(200, json.dumps(data, ensure_ascii=False))
             return
         self._send(404, json.dumps({"error": "not found"}))
@@ -611,5 +487,6 @@ if __name__ == "__main__":
     print("英雄/装备表预热中...")
     get_heroes()
     get_items()
-    print("Dota 查询服务已启动:  %s:%d" % (HOST, PORT))
-    http.server.HTTPServer((HOST, PORT), Handler).serve_forever()
+    print("Dota 查询服务已启动:  %s:%d(多线程 + TTL缓存%d秒)" % (HOST, PORT, TTL))
+    # ThreadingHTTPServer:并发处理多用户请求,不再一个个排队
+    http.server.ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
