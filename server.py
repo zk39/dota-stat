@@ -44,6 +44,42 @@ MAX_CACHE = int(os.environ.get("DOTA_CACHE_MAX", "2000"))  # 缓存条目上限,
 _ttl_store = {}
 _ttl_lock = threading.Lock()
 
+# ---- 限速 / 熔断:公网暴露后防止被刷爆(nginx 层也应该配一份,这里是第二道保险) ----
+# 按 IP 的固定窗口限速,只管 /api/*(静态页不算钱,不限)。
+RATE_WINDOW = 60
+RATE_MAX = int(os.environ.get("DOTA_RATE_LIMIT_PER_MIN", "60"))   # 每 IP 每分钟最多 /api 请求数
+_rate_store = {}
+_rate_lock = threading.Lock()
+
+# 全局并发上限:同时在处理的请求数超过这个数就直接 503,防止极端流量把线程/内存打爆
+# (ThreadingHTTPServer 是来一个连接开一个线程,没有这个的话没有上限)。
+MAX_CONCURRENT = int(os.environ.get("DOTA_MAX_CONCURRENT", "40"))
+_concurrency_sem = threading.Semaphore(MAX_CONCURRENT)
+CONCURRENCY_WAIT = float(os.environ.get("DOTA_CONCURRENCY_WAIT", "2"))  # 等不到空位就放弃、直接拒绝(秒)
+
+
+def client_ip(handler):
+    """优先取 nginx 转发的真实 IP(反代场景下 handler.client_address 永远是 127.0.0.1)。"""
+    xff = handler.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return handler.client_address[0]
+
+
+def rate_limited(ip):
+    """固定窗口限速:同一 IP 同一分钟内超过 RATE_MAX 次 /api 请求就拒绝。"""
+    now = time.time()
+    bucket = int(now // RATE_WINDOW)
+    key = (ip, bucket)
+    with _rate_lock:
+        if len(_rate_store) > 20000:      # 顺手清掉旧窗口,别无限攒
+            for k in list(_rate_store.keys()):
+                if k[1] < bucket:
+                    _rate_store.pop(k, None)
+        n = _rate_store.get(key, 0) + 1
+        _rate_store[key] = n
+    return n > RATE_MAX
+
 
 def cached(key, fn, ttl=TTL):
     """key 命中且未过期就返回缓存;否则算一次并存(不缓存报错结果)。"""
@@ -404,16 +440,33 @@ def enrich(data):
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+    def _send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
         b = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(b)
 
     def do_GET(self):
+        # 熔断:并发太高就直接拒绝,不排队占线程(等 CONCURRENCY_WAIT 秒还抢不到位就放弃)
+        if not _concurrency_sem.acquire(timeout=CONCURRENCY_WAIT):
+            self._send(503, json.dumps({"error": "服务器当前请求过多,请稍后再试"}, ensure_ascii=False),
+                       headers={"Retry-After": "3"})
+            return
+        try:
+            self._route()
+        finally:
+            _concurrency_sem.release()
+
+    def _route(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path.startswith("/api/") and rate_limited(client_ip(self)):
+            self._send(429, json.dumps({"error": "请求太频繁,请求慢一点"}, ensure_ascii=False),
+                       headers={"Retry-After": "30"})
+            return
         if u.path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
