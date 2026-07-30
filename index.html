@@ -76,11 +76,17 @@ function stopLoad(){ _loads=Math.max(0,_loads-1); if(_loads===0){ _bar.style.wid
 
 /* 缓存 + 请求(命中缓存即时返回;quiet 不触发进度条,用于后台补数据) */
 var CACHE = new Map();
+var INFLIGHT = new Map();   // 进行中的请求:同一 URL 并发只发一次(客户端 single-flight,防狂点重复请求)
 async function _get(url, quiet){
   if(CACHE.has(url)) return CACHE.get(url);
+  if(INFLIGHT.has(url)) return INFLIGHT.get(url);   // 已在请求中 → 复用同一个 Promise,不再发新请求
   if(!quiet) startLoad();
-  try{ var r=await fetch(url); var d=await r.json(); if(d && !d.error) CACHE.set(url,d); return d; }
-  finally{ if(!quiet) stopLoad(); }
+  var p = (async function(){
+    try{ var r=await fetch(url); var d=await r.json(); if(d && !d.error) CACHE.set(url,d); return d; }
+    finally{ INFLIGHT.delete(url); if(!quiet) stopLoad(); }
+  })();
+  INFLIGHT.set(url, p);
+  return p;
 }
 function fetchJSON(u){ return _get(u,false); }
 function fetchQuiet(u){ return _get(u,true); }
@@ -158,8 +164,12 @@ function route(){
 }
 
 /* ============ 统一搜索(自动判断:纯数字按 id/对局 走,其余按名字搜) ============ */
+var _lastSearchAt=0;
 function onSearch(e){
   e.preventDefault();
+  var now=Date.now();
+  if(now-_lastSearchAt<400) return;   // leading 节流:400ms 内的重复点击忽略(首次立即响应)
+  _lastSearchAt=now;
   var v=document.getElementById('q').value.trim(); if(!v) return;
   var isNum=/^\d+$/.test(v);
   if(!isNum) return go('#/search/'+encodeURIComponent(v));
