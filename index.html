@@ -167,8 +167,12 @@
 		<div class="mx-auto max-w-[1400px] px-3 py-3 sm:px-6 sm:py-4 lg:px-8">
 			<div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
 				<div class="flex items-center justify-between gap-3 sm:contents">
-					<a href="#/" class="shrink-0 text-lg font-bold tracking-tight sm:text-2xl"
-						style="color:var(--accent)">DOTA<span style="color:var(--text)">战绩</span></a>
+					<div class="flex min-w-0 items-center gap-2">
+						<button onclick="goBack()" id="backBtn" title="返回上一页"
+							class="chip hidden shrink-0 rounded-lg px-2.5 py-2 text-sm sm:hidden">←</button>
+						<a href="#/" class="shrink-0 text-lg font-bold tracking-tight sm:text-2xl"
+							style="color:var(--accent)">DOTA<span style="color:var(--text)">战绩</span></a>
+					</div>
 					<button onclick="toggleTheme()" id="themeBtn"
 						class="chip shrink-0 rounded-lg px-3 py-2 text-xs sm:order-3 sm:px-4 sm:py-3 sm:text-sm"></button>
 				</div>
@@ -507,9 +511,25 @@
 			route();
 		});
 
+		function goBack() {
+			// 大多数时候站内是有上一页历史的(go() 每次都会往 history 里压一条 hash 记录),
+			// 但如果用户是直接打开一个 /player/xxx 这样的深链进来的,history 里没有上一页,
+			// 这时候退回首页,总比停在原地或者退出浏览器标签页强。
+			if (window.history.length > 1) window.history.back();
+			else go('#/');
+		}
+
 		function route() {
 			var h = location.hash.replace(/^#/, '') || '/';
 			var parts = h.split('/').filter(Boolean);
+			var backBtn = document.getElementById('backBtn');
+			if (backBtn) backBtn.classList.toggle('hidden', parts.length === 0);
+			// 除了搜索页,其它页面都清空搜索框——不然从"搜 xxx"跳到别的玩家主页后,
+			// 顶部搜索框还留着上一次搜的名字,容易让人以为自己还在看 xxx 的搜索结果。
+			if (parts[0] !== 'search') {
+				var qEl = document.getElementById('q');
+				if (qEl) qEl.value = '';
+			}
 			if (parts[0] === 'player') return viewPlayer(parts[1]);
 			if (parts[0] === 'match') return viewMatch(parts[1]);
 			if (parts[0] === 'search') return viewSearch(decodeURIComponent(parts.slice(1).join('/')));
