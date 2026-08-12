@@ -161,8 +161,13 @@ STRATZ_URL = "https://api.stratz.com/graphql"
 # ---- 对局地区:Valve 的 region id -> 人类可读名称,数据取自 odota/dotaconstants(region.json)。
 # cluster -> region 的映射(cluster.json)留作兜底:极老的对局有的没有直接的 region 字段。
 REGION_NAMES_ZH = {
-    1: "美西", 2: "美东", 3: "欧洲", 5: "新加坡", 6: "迪拜",
-    7: "澳大利亚", 8: "斯德哥尔摩", 9: "奥地利", 10: "巴西", 11: "南非",
+    # id 3 / 9 在 dotaconstants 的 region.json 里原始名字是笼统的 "EUROPE"/"AUSTRIA",
+    # 但对应的实际机房是卢森堡(欧洲西)和维也纳(欧洲东)——跟游戏内选服务器列表的
+    # "Europe West"/"Europe East" 是同一回事,这里换成更具体的叫法。
+    # id 5 同理:dotaconstants 里叫 "SINGAPORE"(机房城市),但游戏内选服列表这个区
+    # 叫 "Southeast Asia"(东南亚/SEA),玩家更认这个名字。
+    1: "美西", 2: "美东", 3: "欧洲西", 5: "东南亚", 6: "迪拜",
+    7: "澳大利亚", 8: "斯德哥尔摩", 9: "欧洲东", 10: "巴西", 11: "南非",
     12: "上海电信", 13: "中国联通", 14: "智利", 15: "秘鲁",
     16: "印度", 17: "广东电信", 18: "浙江电信",
     19: "日本", 20: "武汉电信", 25: "天津联通",
@@ -684,6 +689,13 @@ def fetch_player_matches(account_id, limit=50, hero_id=None):
         radiant = int(m.get("player_slot", 0)) < 128
         m["_hero"] = info
         m["_win"] = (radiant == bool(m.get("radiant_win")))
+        # 战绩列表这个接口本身不带地区字段(OpenDota /players/{id}/matches 里没有 region/cluster),
+        # 不能为了显示地区就给列表里每一场都单独再查一次对局详情——50 场等于 50 次额外请求,
+        # 页面会卡得没法用,后端限速/OpenDota 配额也扛不住。折中方案:只查本地 SQLite 缓存
+        # (od_cache,纯本地读,没有网络开销),如果这场之前被人打开过"对局详情"页,地区数据
+        # 已经缓存在那了就顺手带出来;没缓存过的就不显示,不主动为它多发请求。
+        cached_match = db_get_od(m.get("match_id"))
+        m["_region_name"] = region_name(cached_match.get("region"), cached_match.get("cluster")) if cached_match else None
         out.append(m)
     return {"account_id": aid, "matches": out, "hero_id": hero_id}
 

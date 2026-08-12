@@ -860,7 +860,7 @@
 
 		function matchTable(rows) {
 			if (!rows.length) return '<p class="text-sm muted">无数据。</p>';
-			var body = tableOpen(['英雄', '类型', 'K/D/A', '胜负', '水平段', '时间', '']);
+			var body = tableOpen(['英雄', '类型', 'K/D/A', '胜负', '水平段', '地区', '时间', '']);
 			var mbody = mlistOpen();
 			rows.forEach(function (m) {
 				var hero = m._hero || {};
@@ -871,12 +871,17 @@
 				var when = new Date(m.start_time * 1000).toLocaleDateString();
 				var wl = m._win ? '<span class="text-emerald-600 dark:text-emerald-400">胜</span>' :
 					'<span class="text-rose-600 dark:text-rose-400">负</span>';
+				// 地区数据只在这场对局的详情曾经被人查过、缓存里已经有的情况下才带得出来(见
+				// server.py fetch_player_matches 的注释),没缓存过就是空的,用"—"占位,
+				// 不是漏了,是没为了这一格数据去多发一次请求。
+				var region = m._region_name ? esc(m._region_name) : '<span class="muted2">—</span>';
 				body += '<tr class="rowh"><td class="px-3 py-2">' + img + esc(hero.name || ('#' + m.hero_id)) +
 					'</td>' +
 					'<td class="px-3 py-2 muted">' + lobbyLabel(m) + '</td><td class="px-3 py-2">' + m.kills + ' / ' +
 					m.deaths + ' / ' + m.assists + '</td>' +
 					'<td class="px-3 py-2">' + wl + '</td><td class="px-3 py-2">' + rankBadge(m.average_rank) +
 					'</td>' +
+					'<td class="px-3 py-2 muted">' + region + '</td>' +
 					'<td class="px-3 py-2 muted2">' + esc(when) + '</td>' +
 					'<td class="px-3 py-2 text-right">' + pill('详情', false, "go('#/match/" + m.match_id + "')") +
 					'</td></tr>';
@@ -887,6 +892,7 @@
 					lobbyLabel(m) + '</span><span class="muted2">·</span>' +
 					'<span>' + m.kills + '/' + m.deaths + '/' + m.assists +
 					'</span><span class="muted2">·</span>' + rankBadge(m.average_rank) +
+					(m._region_name ? '<span class="muted2">·</span><span>' + esc(m._region_name) + '</span>' : '') +
 					'<span class="muted2">·</span><span class="muted2">' + esc(when) + '</span></div></div>' +
 					pill('详情', false, "go('#/match/" + m.match_id + "')"));
 			});
