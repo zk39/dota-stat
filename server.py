@@ -242,7 +242,8 @@ def _get_json(url, _retry=0, timeout=25, retry5xx=True):
             time.sleep(back)
             return _get_json(url, _retry + 1, timeout, retry5xx)
         raise
-    except urllib.error.URLError as e:          # 连接超时/无响应
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:   # 连接/读取超时、无响应
+        # 注意:读取阶段的超时抛的是 TimeoutError(socket.timeout),不是 URLError,得一起接住
         if retry5xx and _retry < 2:
             time.sleep(2 * (_retry + 1))
             return _get_json(url, _retry + 1, timeout, retry5xx)
@@ -394,16 +395,33 @@ def _stratz_request(query, variables=None):
 def search_players(q):
     """按游戏昵称搜玩家。Valve 没有按昵称搜人的接口,只能用 OpenDota /search;
     STRATZ 的公开 API 不支持按名字搜索(实测过 schema,player/players 只接受数字 ID),
-    所以这里没有备用数据源,查不到就是查不到。"""
+    所以这里没有备用数据源。
+    OpenDota /search 是全文检索,经常要 10 秒以上才返回,超时不能设太短;
+    失败时必须返回 {"error": ...}——否则空结果会被 cached() 缓存 10 分钟,
+    用户会一直看到“没搜到”,而实际只是上游超时了。"""
+    last_err = None
     arr = None
-    try:
-        arr = od_get("/search", {"q": q}, timeout=6, retry5xx=False)   # 该接口响应不稳定,设置较短超时并快速失败
-    except Exception as e:
-        print("OpenDota /search 失败:", e)
-    if arr:
-        arr.sort(key=lambda x: (x.get("last_match_time") or ""), reverse=True)
-        return {"query": q, "results": arr, "_source": "opendota"}
-    return {"query": q, "results": []}
+    for attempt in range(2):                     # 最多试 2 次:/search 偶发超时/5xx,重试一次通常就好
+        try:
+            arr = od_get("/search", {"q": q}, timeout=20, retry5xx=False)
+            break
+        except urllib.error.HTTPError as e:
+            last_err = "HTTP %s" % e.code
+            if e.code not in (500, 502, 503, 504, 522, 524):
+                break                            # 4xx 之类重试也没用
+        except Exception as e:
+            last_err = str(e) or e.__class__.__name__
+        print("OpenDota /search 失败(第 %d 次): %s" % (attempt + 1, last_err))
+        time.sleep(1)
+    if arr is None:
+        return {"error": "搜索服务暂时不可用(OpenDota /search: %s),请稍后重试" % last_err}
+    if isinstance(arr, dict):                    # OpenDota 出错时可能返回 {"error": "..."}
+        return {"error": "OpenDota 搜索出错: %s" % (arr.get("error") or arr)}
+    if not isinstance(arr, list):
+        return {"error": "OpenDota 搜索返回了无法识别的数据"}
+    arr = [x for x in arr if isinstance(x, dict) and x.get("account_id")]
+    arr.sort(key=lambda x: (x.get("last_match_time") or ""), reverse=True)
+    return {"query": q, "results": arr, "_source": "opendota"}
 
 
 def stratz_fetch_player(account_id):
@@ -852,7 +870,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not name:
                 self._send(400, json.dumps({"error": "请输入游戏名"}, ensure_ascii=False))
                 return
+            # 空结果只缓存 60 秒:OpenDota 索引偶尔滞后,别让一次“没搜到”卡住 10 分钟
             data = cached("search:" + name, lambda: search_players(name))
+            if not data.get("error") and not data.get("results"):
+                with _ttl_lock:
+                    ent = _ttl_store.get("search:" + name)
+                    if ent:
+                        _ttl_store["search:" + name] = (min(ent[0], time.time() + 60), ent[1])
             self._send(200, json.dumps(data, ensure_ascii=False))
             return
         if u.path == "/api/rank":
